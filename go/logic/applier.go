@@ -1,5 +1,5 @@
 /*
-   Copyright 2021 GitHub Inc.
+   Copyright 2022 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
@@ -8,7 +8,7 @@ package logic
 import (
 	gosql "database/sql"
 	"fmt"
-	"sync"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -22,7 +22,8 @@ import (
 )
 
 const (
-	atomicCutOverMagicHint = "ghost-cut-over-sentry"
+	GhostChangelogTableComment = "gh-ost changelog"
+	atomicCutOverMagicHint     = "ghost-cut-over-sentry"
 )
 
 type dmlBuildResult struct {
@@ -47,7 +48,7 @@ func newDmlBuildResultError(err error) *dmlBuildResult {
 	}
 }
 
-// Applier connects and writes the the applier-server, which is the server where migration
+// Applier connects and writes the applier-server, which is the server where migration
 // happens. This is typically the master, but could be a replica when `--test-on-replica` or
 // `--execute-on-replica` are given.
 // Applier is the one to actually write row data and apply binlog events onto the ghost table.
@@ -71,7 +72,6 @@ func NewApplier(migrationContext *base.MigrationContext) *Applier {
 }
 
 func (this *Applier) InitDBConnections() (err error) {
-
 	applierUri := this.connectionConfig.GetDBUri(this.migrationContext.DatabaseName)
 	if this.db, _, err = mysql.GetDB(this.migrationContext.Uuid, applierUri); err != nil {
 		return err
@@ -115,6 +115,33 @@ func (this *Applier) validateAndReadTimeZone() error {
 
 	this.migrationContext.Log.Infof("will use time_zone='%s' on applier", this.migrationContext.ApplierTimeZone)
 	return nil
+}
+
+// generateSqlModeQuery return a `sql_mode = ...` query, to be wrapped with a `set session` or `set global`,
+// based on gh-ost configuration:
+// - User may skip strict mode
+// - User may allow zero dats or zero in dates
+func (this *Applier) generateSqlModeQuery() string {
+	sqlModeAddendum := []string{`NO_AUTO_VALUE_ON_ZERO`}
+	if !this.migrationContext.SkipStrictMode {
+		sqlModeAddendum = append(sqlModeAddendum, `STRICT_ALL_TABLES`)
+	}
+	sqlModeQuery := fmt.Sprintf("CONCAT(@@session.sql_mode, ',%s')", strings.Join(sqlModeAddendum, ","))
+	if this.migrationContext.AllowZeroInDate {
+		sqlModeQuery = fmt.Sprintf("REPLACE(REPLACE(%s, 'NO_ZERO_IN_DATE', ''), 'NO_ZERO_DATE', '')", sqlModeQuery)
+	}
+
+	return fmt.Sprintf("sql_mode = %s", sqlModeQuery)
+}
+
+// generateInstantDDLQuery returns the SQL for this ALTER operation
+// with an INSTANT assertion (requires MySQL 8.0+)
+func (this *Applier) generateInstantDDLQuery() string {
+	return fmt.Sprintf(`ALTER /* gh-ost */ TABLE %s.%s %s, ALGORITHM=INSTANT`,
+		sql.EscapeName(this.migrationContext.DatabaseName),
+		sql.EscapeName(this.migrationContext.OriginalTableName),
+		this.migrationContext.AlterStatementOptions,
+	)
 }
 
 // readTableColumns reads table columns on applier
@@ -170,6 +197,27 @@ func (this *Applier) ValidateOrDropExistingTables() error {
 	return nil
 }
 
+// AttemptInstantDDL attempts to use instant DDL (from MySQL 8.0, and earlier in Aurora and some others).
+// If successful, the operation is only a meta-data change so a lot of time is saved!
+// The risk of attempting to instant DDL when not supported is that a metadata lock may be acquired.
+// This is minor, since gh-ost will eventually require a metadata lock anyway, but at the cut-over stage.
+// Instant operations include:
+// - Adding a column
+// - Dropping a column
+// - Dropping an index
+// - Extending a VARCHAR column
+// - Adding a virtual generated column
+// It is not reliable to parse the `alter` statement to determine if it is instant or not.
+// This is because the table might be in an older row format, or have some other incompatibility
+// that is difficult to identify.
+func (this *Applier) AttemptInstantDDL() error {
+	query := this.generateInstantDDLQuery()
+	this.migrationContext.Log.Infof("INSTANT DDL query is: %s", query)
+	// We don't need a trx, because for instant DDL the SQL mode doesn't matter.
+	_, err := this.db.Exec(query)
+	return err
+}
+
 // CreateGhostTable creates the ghost table on the applier host
 func (this *Applier) CreateGhostTable() error {
 	query := fmt.Sprintf(`create /* gh-ost */ table %s.%s like %s.%s`,
@@ -182,11 +230,33 @@ func (this *Applier) CreateGhostTable() error {
 		sql.EscapeName(this.migrationContext.DatabaseName),
 		sql.EscapeName(this.migrationContext.GetGhostTableName()),
 	)
-	if _, err := sqlutils.ExecNoPrepare(this.db, query); err != nil {
-		return err
-	}
-	this.migrationContext.Log.Infof("Ghost table created")
-	return nil
+
+	err := func() error {
+		tx, err := this.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+
+		sessionQuery := fmt.Sprintf(`SET SESSION time_zone = '%s'`, this.migrationContext.ApplierTimeZone)
+		sessionQuery = fmt.Sprintf("%s, %s", sessionQuery, this.generateSqlModeQuery())
+
+		if _, err := tx.Exec(sessionQuery); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(query); err != nil {
+			return err
+		}
+		this.migrationContext.Log.Infof("Ghost table created")
+		if err := tx.Commit(); err != nil {
+			// Neither SET SESSION nor ALTER are really transactional, so strictly speaking
+			// there's no need to commit; but let's do this the legit way anyway.
+			return err
+		}
+		return nil
+	}()
+
+	return err
 }
 
 // AlterGhost applies `alter` statement on ghost table
@@ -201,11 +271,33 @@ func (this *Applier) AlterGhost() error {
 		sql.EscapeName(this.migrationContext.GetGhostTableName()),
 	)
 	this.migrationContext.Log.Debugf("ALTER statement: %s", query)
-	if _, err := sqlutils.ExecNoPrepare(this.db, query); err != nil {
-		return err
-	}
-	this.migrationContext.Log.Infof("Ghost table altered")
-	return nil
+
+	err := func() error {
+		tx, err := this.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+
+		sessionQuery := fmt.Sprintf(`SET SESSION time_zone = '%s'`, this.migrationContext.ApplierTimeZone)
+		sessionQuery = fmt.Sprintf("%s, %s", sessionQuery, this.generateSqlModeQuery())
+
+		if _, err := tx.Exec(sessionQuery); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(query); err != nil {
+			return err
+		}
+		this.migrationContext.Log.Infof("Ghost table altered")
+		if err := tx.Commit(); err != nil {
+			// Neither SET SESSION nor ALTER are really transactional, so strictly speaking
+			// there's no need to commit; but let's do this the legit way anyway.
+			return err
+		}
+		return nil
+	}()
+
+	return err
 }
 
 // AlterGhost applies `alter` statement on ghost table
@@ -233,16 +325,16 @@ func (this *Applier) CreateChangelogTable() error {
 		return err
 	}
 	query := fmt.Sprintf(`create /* gh-ost */ table %s.%s (
-			id bigint auto_increment,
+			id bigint unsigned auto_increment,
 			last_update timestamp not null DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 			hint varchar(64) charset ascii not null,
 			value varchar(4096) charset ascii not null,
 			primary key(id),
 			unique key hint_uidx(hint)
-		) auto_increment=256
-		`,
+		) auto_increment=256 comment='%s'`,
 		sql.EscapeName(this.migrationContext.DatabaseName),
 		sql.EscapeName(this.migrationContext.GetChangelogTableName()),
+		GhostChangelogTableComment,
 	)
 	this.migrationContext.Log.Infof("Creating changelog table %s.%s",
 		sql.EscapeName(this.migrationContext.DatabaseName),
@@ -344,8 +436,9 @@ func (this *Applier) InitiateHeartbeat() {
 	}
 	injectHeartbeat()
 
-	heartbeatTick := time.Tick(time.Duration(this.migrationContext.HeartbeatIntervalMilliseconds) * time.Millisecond)
-	for range heartbeatTick {
+	ticker := time.NewTicker(time.Duration(this.migrationContext.HeartbeatIntervalMilliseconds) * time.Millisecond)
+	defer ticker.Stop()
+	for range ticker.C {
 		if atomic.LoadInt64(&this.finishedMigrating) > 0 {
 			return
 		}
@@ -375,17 +468,20 @@ func (this *Applier) ExecuteThrottleQuery() (int64, error) {
 	return result, nil
 }
 
-// ReadMigrationMinValues returns the minimum values to be iterated on rowcopy
-func (this *Applier) ReadMigrationMinValues(uniqueKey *sql.UniqueKey) error {
+// readMigrationMinValues returns the minimum values to be iterated on rowcopy
+func (this *Applier) readMigrationMinValues(tx *gosql.Tx, uniqueKey *sql.UniqueKey) error {
 	this.migrationContext.Log.Debugf("Reading migration range according to key: %s", uniqueKey.Name)
 	query, err := sql.BuildUniqueKeyMinValuesPreparedQuery(this.migrationContext.DatabaseName, this.migrationContext.OriginalTableName, &uniqueKey.Columns)
 	if err != nil {
 		return err
 	}
-	rows, err := this.db.Query(query)
+
+	rows, err := tx.Query(query)
 	if err != nil {
 		return err
 	}
+	defer rows.Close()
+
 	for rows.Next() {
 		this.migrationContext.MigrationRangeMinValues = sql.NewColumnValues(uniqueKey.Len())
 		if err = rows.Scan(this.migrationContext.MigrationRangeMinValues.ValuesPointers...); err != nil {
@@ -394,21 +490,23 @@ func (this *Applier) ReadMigrationMinValues(uniqueKey *sql.UniqueKey) error {
 	}
 	this.migrationContext.Log.Infof("Migration min values: [%s]", this.migrationContext.MigrationRangeMinValues)
 
-	err = rows.Err()
-	return err
+	return rows.Err()
 }
 
-// ReadMigrationMaxValues returns the maximum values to be iterated on rowcopy
-func (this *Applier) ReadMigrationMaxValues(uniqueKey *sql.UniqueKey) error {
+// readMigrationMaxValues returns the maximum values to be iterated on rowcopy
+func (this *Applier) readMigrationMaxValues(tx *gosql.Tx, uniqueKey *sql.UniqueKey) error {
 	this.migrationContext.Log.Debugf("Reading migration range according to key: %s", uniqueKey.Name)
 	query, err := sql.BuildUniqueKeyMaxValuesPreparedQuery(this.migrationContext.DatabaseName, this.migrationContext.OriginalTableName, &uniqueKey.Columns)
 	if err != nil {
 		return err
 	}
-	rows, err := this.db.Query(query)
+
+	rows, err := tx.Query(query)
 	if err != nil {
 		return err
 	}
+	defer rows.Close()
+
 	for rows.Next() {
 		this.migrationContext.MigrationRangeMaxValues = sql.NewColumnValues(uniqueKey.Len())
 		if err = rows.Scan(this.migrationContext.MigrationRangeMaxValues.ValuesPointers...); err != nil {
@@ -417,19 +515,45 @@ func (this *Applier) ReadMigrationMaxValues(uniqueKey *sql.UniqueKey) error {
 	}
 	this.migrationContext.Log.Infof("Migration max values: [%s]", this.migrationContext.MigrationRangeMaxValues)
 
-	err = rows.Err()
-	return err
+	return rows.Err()
 }
 
-// ReadMigrationRangeValues reads min/max values that will be used for rowcopy
+// ReadMigrationRangeValues reads min/max values that will be used for rowcopy.
+// Before read min/max, write a changelog state into the ghc table to avoid lost data in mysql two-phase commit.
+/*
+Detail description of the lost data in mysql two-phase commit issue by @Fanduzi:
+	When using semi-sync and setting rpl_semi_sync_master_wait_point=AFTER_SYNC,
+	if an INSERT statement is being committed but blocks due to an unmet ack count,
+	the data inserted by the transaction is not visible to ReadMigrationRangeValues,
+	so the copy of the existing data in the table does not include the new row inserted by the transaction.
+	However, the binlog event for the transaction is already written to the binlog,
+	so the addDMLEventsListener only captures the binlog event after the transaction,
+	and thus the transaction's binlog event is not captured, resulting in data loss.
+
+	If write a changelog into ghc table before ReadMigrationRangeValues, and the transaction commit blocks
+	because the ack is not met, then the changelog will not be able to write, so the ReadMigrationRangeValues
+	will not be run. When the changelog writes successfully, the ReadMigrationRangeValues will read the
+	newly inserted data, thus Avoiding data loss due to the above problem.
+*/
 func (this *Applier) ReadMigrationRangeValues() error {
-	if err := this.ReadMigrationMinValues(this.migrationContext.UniqueKey); err != nil {
+	if _, err := this.WriteChangelogState(string(ReadMigrationRangeValues)); err != nil {
 		return err
 	}
-	if err := this.ReadMigrationMaxValues(this.migrationContext.UniqueKey); err != nil {
+
+	tx, err := this.db.Begin()
+	if err != nil {
 		return err
 	}
-	return nil
+	defer tx.Rollback()
+
+	if err := this.readMigrationMinValues(tx, this.migrationContext.UniqueKey); err != nil {
+		return err
+	}
+	if err := this.readMigrationMaxValues(tx, this.migrationContext.UniqueKey); err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 // CalculateNextIterationRangeEndValues reads the next-iteration-range-end unique key values,
@@ -459,10 +583,13 @@ func (this *Applier) CalculateNextIterationRangeEndValues() (hasFurtherRange boo
 		if err != nil {
 			return hasFurtherRange, err
 		}
+
 		rows, err := this.db.Query(query, explodedArgs...)
 		if err != nil {
 			return hasFurtherRange, err
 		}
+		defer rows.Close()
+
 		iterationRangeMaxValues := sql.NewColumnValues(this.migrationContext.UniqueKey.Len())
 		for rows.Next() {
 			if err = rows.Scan(iterationRangeMaxValues.ValuesPointers...); err != nil {
@@ -511,12 +638,9 @@ func (this *Applier) ApplyIterationInsertQuery() (chunkSize int64, rowsAffected 
 			return nil, err
 		}
 		defer tx.Rollback()
+
 		sessionQuery := fmt.Sprintf(`SET SESSION time_zone = '%s'`, this.migrationContext.ApplierTimeZone)
-		sqlModeAddendum := `,NO_AUTO_VALUE_ON_ZERO`
-		if !this.migrationContext.SkipStrictMode {
-			sqlModeAddendum = fmt.Sprintf("%s,STRICT_ALL_TABLES", sqlModeAddendum)
-		}
-		sessionQuery = fmt.Sprintf("%s, sql_mode = CONCAT(@@session.sql_mode, ',%s')", sessionQuery, sqlModeAddendum)
+		sessionQuery = fmt.Sprintf("%s, %s", sessionQuery, this.generateSqlModeQuery())
 
 		if _, err := tx.Exec(sessionQuery); err != nil {
 			return nil, err
@@ -810,7 +934,7 @@ func (this *Applier) CreateAtomicCutOverSentryTable() error {
 }
 
 // AtomicCutOverMagicLock
-func (this *Applier) AtomicCutOverMagicLock(sessionIdChan chan int64, tableLocked chan<- error, okToUnlockTable <-chan bool, tableUnlocked chan<- error, dropCutOverSentryTableOnce *sync.Once) error {
+func (this *Applier) AtomicCutOverMagicLock(sessionIdChan chan int64, tableLocked chan<- error, okToUnlockTable <-chan bool, tableUnlocked chan<- error) error {
 	tx, err := this.db.Begin()
 	if err != nil {
 		tableLocked <- err
@@ -821,6 +945,7 @@ func (this *Applier) AtomicCutOverMagicLock(sessionIdChan chan int64, tableLocke
 		tableLocked <- fmt.Errorf("Unexpected error in AtomicCutOverMagicLock(), injected to release blocking channel reads")
 		tableUnlocked <- fmt.Errorf("Unexpected error in AtomicCutOverMagicLock(), injected to release blocking channel reads")
 		tx.Rollback()
+		this.DropAtomicCutOverSentryTableIfExists()
 	}()
 
 	var sessionId int64
@@ -889,12 +1014,10 @@ func (this *Applier) AtomicCutOverMagicLock(sessionIdChan chan int64, tableLocke
 		sql.EscapeName(this.migrationContext.GetOldTableName()),
 	)
 
-	dropCutOverSentryTableOnce.Do(func() {
-		if _, err := tx.Exec(query); err != nil {
-			this.migrationContext.Log.Errore(err)
-			// We DO NOT return here because we must `UNLOCK TABLES`!
-		}
-	})
+	if _, err := tx.Exec(query); err != nil {
+		this.migrationContext.Log.Errore(err)
+		// We DO NOT return here because we must `UNLOCK TABLES`!
+	}
 
 	// Tables still locked
 	this.migrationContext.Log.Infof("Releasing lock from %s.%s, %s.%s",
@@ -1014,7 +1137,6 @@ func (this *Applier) buildDMLEventQuery(dmlEvent *binlog.BinlogDMLEvent) (result
 
 // ApplyDMLEventQueries applies multiple DML queries onto the _ghost_ table
 func (this *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent)) error {
-
 	var totalDelta int64
 
 	err := func() error {
@@ -1029,12 +1151,7 @@ func (this *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent)) 
 		}
 
 		sessionQuery := "SET SESSION time_zone = '+00:00'"
-
-		sqlModeAddendum := `,NO_AUTO_VALUE_ON_ZERO`
-		if !this.migrationContext.SkipStrictMode {
-			sqlModeAddendum = fmt.Sprintf("%s,STRICT_ALL_TABLES", sqlModeAddendum)
-		}
-		sessionQuery = fmt.Sprintf("%s, sql_mode = CONCAT(@@session.sql_mode, ',%s')", sessionQuery, sqlModeAddendum)
+		sessionQuery = fmt.Sprintf("%s, %s", sessionQuery, this.generateSqlModeQuery())
 
 		if _, err := tx.Exec(sessionQuery); err != nil {
 			return rollback(err)
@@ -1046,7 +1163,7 @@ func (this *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent)) 
 				}
 				result, err := tx.Exec(buildResult.query, buildResult.args...)
 				if err != nil {
-					err = fmt.Errorf("%s; query=%s; args=%+v", err.Error(), buildResult.query, buildResult.args)
+					err = fmt.Errorf("%w; query=%s; args=%+v", err, buildResult.query, buildResult.args)
 					return rollback(err)
 				}
 

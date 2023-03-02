@@ -6,6 +6,10 @@ A more in-depth discussion of various `gh-ost` command line flags: implementatio
 
 Add this flag when executing on Aliyun RDS.
 
+### allow-zero-in-date
+
+Allows the user to make schema changes that include a zero date or zero in date (e.g. adding a `datetime default '0000-00-00 00:00:00'` column), even if global `sql_mode` on MySQL has `NO_ZERO_IN_DATE,NO_ZERO_DATE`.
+
 ###  azure
 
 Add this flag when executing on Azure Database for MySQL.
@@ -22,7 +26,7 @@ If, for some reason, you do not wish `gh-ost` to connect to a replica, you may c
 
 ### approve-renamed-columns
 
-When your migration issues a column rename (`change column old_name new_name ...`) `gh-ost` analyzes the statement to try and associate the old column name with new column name. Otherwise the new structure may also look like some column was dropped and another was added.
+When your migration issues a column rename (`change column old_name new_name ...`) `gh-ost` analyzes the statement to try and associate the old column name with new column name. Otherwise, the new structure may also look like some column was dropped and another was added.
 
 `gh-ost` will print out what it thinks the _rename_ implied, but will not issue the migration unless you provide with `--approve-renamed-columns`.
 
@@ -32,7 +36,7 @@ If you think `gh-ost` is mistaken and that there's actually no _rename_ involved
 
 `gh-ost` infers the identity of the master server by crawling up the replication topology. You may explicitly tell `gh-ost` the identity of the master host via `--assume-master-host=the.master.com`. This is useful in:
 
-- _master-master_ topologies (together with [`--allow-master-master`](#allow-master-master)), where `gh-ost` can arbitrarily pick one of the co-masters and you prefer that it picks a specific one
+- _master-master_ topologies (together with [`--allow-master-master`](#allow-master-master)), where `gh-ost` can arbitrarily pick one of the co-masters, and you prefer that it picks a specific one
 - _tungsten replicator_ topologies (together with [`--tungsten`](#tungsten)), where `gh-ost` is unable to crawl and detect the master
 
 ### assume-rbr
@@ -40,6 +44,22 @@ If you think `gh-ost` is mistaken and that there's actually no _rename_ involved
 If you happen to _know_ your servers use RBR (Row Based Replication, i.e. `binlog_format=ROW`), you may specify `--assume-rbr`. This skips a verification step where `gh-ost` would issue a `STOP SLAVE; START SLAVE`.
 Skipping this step means `gh-ost` would not need the `SUPER` privilege in order to operate.
 You may want to use this on Amazon RDS.
+
+### attempt-instant-ddl
+
+MySQL 8.0 supports "instant DDL" for some operations. If an alter statement can be completed with instant DDL, only a metadata change is required internally. Instant operations include:
+
+- Adding a column
+- Dropping a column
+- Dropping an index
+- Extending a varchar column
+- Adding a virtual generated column
+
+It is not reliable to parse the `ALTER` statement to determine if it is instant or not. This is because the table might be in an older row format, or have some other incompatibility that is difficult to identify.
+
+`--attempt-instant-ddl` is disabled by default, but the risks of enabling it are relatively minor: `gh-ost` may need to acquire a metadata lock at the start of the operation. This is not a problem for most scenarios, but it could be a problem for users that start the DDL during a period with long running transactions.
+
+`gh-ost` will automatically fallback to the normal DDL process if the attempt to use instant DDL is unsuccessful.
 
 ### conf
 
@@ -61,7 +81,13 @@ Comma delimited status-name=threshold, same format as [`--max-load`](#max-load).
 
 `--critical-load` defines a threshold that, when met, `gh-ost` panics and bails out. The default behavior is to bail out immediately when meeting this threshold.
 
-This may sometimes lead to migrations bailing out on a very short spike, that, while in itself is impacting production and is worth investigating, isn't reason enough to kill a 10 hour migration.
+This may sometimes lead to migrations bailing out on a very short spike, that, while in itself is impacting production and is worth investigating, isn't reason enough to kill a 10-hour migration.
+
+### critical-load-hibernate-seconds
+
+When `--critical-load-hibernate-seconds` is non-zero (e.g. `--critical-load-hibernate-seconds=300`), `critical-load` does not panic and bail out; instead, `gh-ost` goes into hibernation for the specified duration. It will not read/write anything from/to any server during this time.  Execution then continues upon waking from hibernation.
+
+If `critical-load` is met again, `gh-ost` will repeat this cycle, and never panic and bail out.
 
 ### critical-load-interval-millis
 
@@ -98,7 +124,7 @@ Noteworthy is that setting `--dml-batch-size` to higher value _does not_ mean `g
 
 ### exact-rowcount
 
-A `gh-ost` execution need to copy whatever rows you have in your existing table onto the ghost table. This can, and often be, a large number. Exactly what that number is?
+A `gh-ost` execution need to copy whatever rows you have in your existing table onto the ghost table. This can and often will be, a large number. Exactly what that number is?
 `gh-ost` initially estimates the number of rows in your table by issuing an `explain select * from your_table`. This will use statistics on your table and return with a rough estimate. How rough? It might go as low as half or as high as double the actual number of rows in your table. This is the same method as used in [`pt-online-schema-change`](https://www.percona.com/doc/percona-toolkit/2.2/pt-online-schema-change.html).
 
 `gh-ost` also supports the `--exact-rowcount` flag. When this flag is given, two things happen:
@@ -134,6 +160,10 @@ Add this flag when executing on a 1st generation Google Cloud Platform (GCP).
 ### heartbeat-interval-millis
 
 Default 100. See [`subsecond-lag`](subsecond-lag.md) for details.
+
+### hooks-status-interval
+
+Defaults to 60 seconds. Configures how often the `gh-ost-on-status` hook is called, see [`hooks`](hooks.md) for full details on how to use hooks.
 
 ### initially-drop-ghost-table
 
@@ -216,6 +246,18 @@ Allows `gh-ost` to connect to the MySQL servers using encrypted connections, but
 
 `--ssl-key=/path/to/ssl-key.key`: SSL private key file (in PEM format).
 
+### storage-engine
+Default is `innodb`, and `rocksdb` support is currently experimental. InnoDB and RocksDB are both transactional engines, supporting both shared and exclusive row locks.
+
+But RocksDB currently lacks a few features support compared to InnoDB:
+- Gap Locks
+- Foreign Key
+- Generated Columns
+- Spatial
+- Geometry
+
+When `--storage-engine=rocksdb`, `gh-ost` will make some changes necessary (e.g. sets isolation level to `READ_COMMITTED`) to support RocksDB.
+
 ### test-on-replica
 
 Issue the migration on a replica; do not modify data on master. Useful for validating, testing and benchmarking. See [`testing-on-replica`](testing-on-replica.md)
@@ -230,7 +272,15 @@ Provide a command delimited list of replicas; `gh-ost` will throttle when any of
 
 ### throttle-http
 
-Provide a HTTP endpoint; `gh-ost` will issue `HEAD` requests on given URL and throttle whenever response status code is not `200`. The URL can be queried and updated dynamically via [interactive commands](interactive-commands.md). Empty URL disables the HTTP check.
+Provide an HTTP endpoint; `gh-ost` will issue `HEAD` requests on given URL and throttle whenever response status code is not `200`. The URL can be queried and updated dynamically via [interactive commands](interactive-commands.md). Empty URL disables the HTTP check.
+
+### throttle-http-interval-millis
+
+Defaults to 100. Configures the HTTP throttle check interval in milliseconds.
+
+### throttle-http-timeout-millis
+
+Defaults to 1000 (1 second). Configures the HTTP throttler check timeout in milliseconds.
 
 ### timestamp-old-table
 

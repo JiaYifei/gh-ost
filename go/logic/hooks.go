@@ -1,6 +1,5 @@
 /*
-/*
-   Copyright 2016 GitHub Inc.
+   Copyright 2022 GitHub Inc.
 	 See https://github.com/github/gh-ost/blob/master/LICENSE
 */
 
@@ -8,6 +7,7 @@ package logic
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,16 +35,14 @@ const (
 
 type HooksExecutor struct {
 	migrationContext *base.MigrationContext
+	writer           io.Writer
 }
 
 func NewHooksExecutor(migrationContext *base.MigrationContext) *HooksExecutor {
 	return &HooksExecutor{
 		migrationContext: migrationContext,
+		writer:           os.Stderr,
 	}
-}
-
-func (this *HooksExecutor) initHooks() error {
-	return nil
 }
 
 func (this *HooksExecutor) applyEnvironmentVariables(extraVariables ...string) []string {
@@ -72,20 +70,18 @@ func (this *HooksExecutor) applyEnvironmentVariables(extraVariables ...string) [
 	env = append(env, fmt.Sprintf("GH_OST_HOOKS_HINT_TOKEN=%s", this.migrationContext.HooksHintToken))
 	env = append(env, fmt.Sprintf("GH_OST_DRY_RUN=%t", this.migrationContext.Noop))
 
-	for _, variable := range extraVariables {
-		env = append(env, variable)
-	}
+	env = append(env, extraVariables...)
 	return env
 }
 
 // executeHook executes a command, and sets relevant environment variables
-// combined output & error are printed to gh-ost's standard error.
+// combined output & error are printed to the configured writer.
 func (this *HooksExecutor) executeHook(hook string, extraVariables ...string) error {
 	cmd := exec.Command(hook)
 	cmd.Env = this.applyEnvironmentVariables(extraVariables...)
 
 	combinedOutput, err := cmd.CombinedOutput()
-	fmt.Fprintln(os.Stderr, string(combinedOutput))
+	fmt.Fprintln(this.writer, string(combinedOutput))
 	return log.Errore(err)
 }
 
